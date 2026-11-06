@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   ArrowRight, Banknote, Briefcase, Calculator, CalendarDays, Car, Check, CircleParking, Cloud,
   ChevronLeft, ChevronRight, CircleDollarSign, CreditCard, Gift, HelpCircle,
@@ -140,6 +141,14 @@ const emptySummary: FinanceSummary = {
 
 type EntryTab = "income" | "expense" | "bill" | "card" | "loan" | "investment";
 type View = "Visão geral" | "Movimentações" | "Contas do mês" | "Cartões" | "Investimentos";
+type SimpleDeleteAction = "delete_transaction" | "delete_card" | "delete_card_purchase" | "delete_loan" | "delete_investment";
+type SimpleDeleteTarget = {
+  action: SimpleDeleteAction;
+  id: number;
+  title: string;
+  description: string;
+  success: string;
+};
 
 const currency = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
 const monthFormatter = new Intl.DateTimeFormat("pt-BR", { month: "long", year: "numeric", timeZone: "UTC" });
@@ -154,7 +163,8 @@ const navItems: { label: View; icon: typeof LayoutDashboard }[] = [
 ];
 
 function currentMonthKey() {
-  return new Date().toISOString().slice(0, 7);
+  const today = new Date();
+  return today.getFullYear() + "-" + String(today.getMonth() + 1).padStart(2, "0");
 }
 
 function shiftMonth(month: string, offset: number) {
@@ -290,7 +300,7 @@ function EntryDialog({ open, setOpen, tab, setTab, month, cards, save }: {
               <label>Descrição<Input name="title" placeholder="Ex.: Supermercado" required /></label>
               <div className="form-grid">
                 <label>Valor<Input name="amount" inputMode="decimal" placeholder="Ex.: 185,90" onBlur={normalizeMoneyField} required /></label>
-                <label>Dia do gasto<Input name="day" type="number" min={1} max={28} defaultValue={Math.min(28, new Date().getUTCDate())} required /></label>
+                <label>Dia do gasto<Input name="day" type="number" min={1} max={28} defaultValue={Math.min(28, new Date().getDate())} required /></label>
               </div>
               <label>Categoria
                 <Select name="category" defaultValue="Alimentação">
@@ -678,6 +688,9 @@ function CardPurchaseDialog({ data, month, setOpen, save }: {
 }
 
 export function FinanceDashboard({ userName }: { userName: string }) {
+  const router = useRouter();
+  const loadRequestRef = useRef(0);
+  const saveLockRef = useRef(false);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [bills, setBills] = useState<Bill[]>([]);
   const [cards, setCards] = useState<FinanceCard[]>([]);
@@ -690,6 +703,7 @@ export function FinanceDashboard({ userName }: { userName: string }) {
   const [syncState, setSyncState] = useState<"loading" | "ready" | "error">("loading");
   const [activeNav, setActiveNav] = useState<View>("Visão geral");
   const [month, setMonth] = useState(currentMonthKey());
+  const monthRef = useRef(month);
   const [query, setQuery] = useState("");
   const [dialogOpen, setDialogOpen] = useState(false);
   const [dialogTab, setDialogTab] = useState<EntryTab>("income");
@@ -699,12 +713,15 @@ export function FinanceDashboard({ userName }: { userName: string }) {
   const [editingInvestment, setEditingInvestment] = useState<Investment | null>(null);
   const [editingExpense, setEditingExpense] = useState<Transaction | null>(null);
   const [purchaseDialog, setPurchaseDialog] = useState<{ card: FinanceCard; purchase?: CardPurchase } | null>(null);
+  const [simpleDeleteTarget, setSimpleDeleteTarget] = useState<SimpleDeleteTarget | null>(null);
+  const [incomeDeleteTarget, setIncomeDeleteTarget] = useState<Transaction | null>(null);
   const [billDeleteTarget, setBillDeleteTarget] = useState<Bill | null>(null);
   const [cardBillActionTarget, setCardBillActionTarget] = useState<Bill | null>(null);
   const [billSort, setBillSort] = useState<"alpha" | "high" | "low">("alpha");
   const [commitmentFilter, setCommitmentFilter] = useState<"all" | "bills" | "incidental" | "cards" | "credit">("all");
 
   const loadData = useCallback(async (targetMonth = month) => {
+    const requestId = ++loadRequestRef.current;
     setSyncState("loading");
     try {
       const response = await fetch("/api/finance?month=" + targetMonth, { cache: "no-store" });
@@ -721,6 +738,7 @@ export function FinanceDashboard({ userName }: { userName: string }) {
         investmentTotal: number;
       };
       if (!response.ok) throw new Error(data.error || "Não foi possível carregar seus dados.");
+      if (requestId !== loadRequestRef.current) return;
       setTransactions(data.transactions);
       setBills(data.bills);
       setCards(data.cards);
@@ -732,6 +750,7 @@ export function FinanceDashboard({ userName }: { userName: string }) {
       setInvestmentTotal(data.investmentTotal);
       setSyncState("ready");
     } catch (error) {
+      if (requestId !== loadRequestRef.current) return;
       setSyncState("error");
       toast.error(error instanceof Error ? error.message : "Não foi possível carregar seus dados.");
     }
@@ -743,6 +762,11 @@ export function FinanceDashboard({ userName }: { userName: string }) {
   }, [loadData, month]);
 
   async function save(payload: Record<string, unknown>, success: string) {
+    if (saveLockRef.current) {
+      toast.info("Aguarde a operação atual terminar.");
+      return false;
+    }
+    saveLockRef.current = true;
     try {
       const response = await fetch("/api/finance", {
         method: "POST",
@@ -751,19 +775,22 @@ export function FinanceDashboard({ userName }: { userName: string }) {
       });
       const data = await response.json() as { error?: string };
       if (!response.ok) throw new Error(data.error || "Não foi possível salvar.");
-      await loadData();
+      await loadData(monthRef.current);
       toast.success(success);
       return true;
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Não foi possível salvar.");
       return false;
+    } finally {
+      saveLockRef.current = false;
     }
   }
 
   async function signOut() {
     const supabase = createClient();
     await supabase.auth.signOut();
-    window.location.assign("/auth");
+    router.replace("/auth");
+    router.refresh();
   }
 
   function openEntry(tab: EntryTab) {
@@ -776,20 +803,50 @@ export function FinanceDashboard({ userName }: { userName: string }) {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
-  function changeMonth(offset: number) {
-    setMonth((current) => shiftMonth(current, offset));
+  function selectMonth(nextMonth: string) {
+    if (!nextMonth || nextMonth === month) return;
+    monthRef.current = nextMonth;
+    setSyncState("loading");
+    setTransactions([]);
+    setBills([]);
+    setCards([]);
+    setLoans([]);
+    setPayments([]);
+    setHistory([]);
+    setSummary(emptySummary);
+    setMonth(nextMonth);
   }
 
-  function remove(action: "delete_transaction" | "delete_bill" | "delete_card" | "delete_card_purchase" | "delete_loan" | "delete_investment", id: number, label: string, sequence = false) {
-    if (window.confirm("Excluir " + label + "?" + (sequence ? " Todas as parcelas serão apagadas de todos os meses." : " Esta ação não pode ser desfeita."))) {
-      void save({ action, id }, "Item excluído");
+  function changeMonth(offset: number) {
+    selectMonth(shiftMonth(month, offset));
+  }
+
+  function requestSimpleDelete(target: SimpleDeleteTarget) {
+    setSimpleDeleteTarget(target);
+  }
+
+  async function confirmSimpleDelete() {
+    if (!simpleDeleteTarget) return;
+    if (await save({ action: simpleDeleteTarget.action, id: simpleDeleteTarget.id }, simpleDeleteTarget.success)) {
+      setSimpleDeleteTarget(null);
     }
   }
 
-  function deleteBill(scope: "current" | "sequence") {
+  async function deleteBill(scope: "current" | "sequence") {
     if (!billDeleteTarget) return;
-    void save({ action: "delete_bill", id: billDeleteTarget.id, scope }, scope === "sequence" ? "Conta removida de todos os meses" : "Conta removida deste mês");
-    setBillDeleteTarget(null);
+    if (await save({ action: "delete_bill", id: billDeleteTarget.id, scope }, scope === "sequence" ? "Conta removida de todos os meses" : "Conta removida deste mês")) {
+      setBillDeleteTarget(null);
+    }
+  }
+
+  async function deleteIncome(scope: "current" | "sequence") {
+    if (!incomeDeleteTarget) return;
+    if (await save(
+      { action: "delete_transaction", id: incomeDeleteTarget.id, scope },
+      scope === "sequence" ? "Renda removida de todos os meses" : "Renda removida deste mês",
+    )) {
+      setIncomeDeleteTarget(null);
+    }
   }
 
   function toggleCardBill(bill: Bill, reopenInvoice = false) {
@@ -876,10 +933,10 @@ export function FinanceDashboard({ userName }: { userName: string }) {
             <label>
               <span>Período selecionado</span>
               <strong>{monthLabel(month)}</strong>
-              <input type="month" value={month} onChange={(event) => setMonth(event.target.value)} aria-label="Selecionar mês e ano" />
+              <input type="month" value={month} onChange={(event) => selectMonth(event.target.value)} aria-label="Selecionar mês e ano" />
             </label>
             <button className="period-arrow" onClick={() => changeMonth(1)} aria-label="Ir para o próximo mês"><ChevronRight size={22} /></button>
-            {month !== currentMonthKey() && <button className="period-today" onClick={() => setMonth(currentMonthKey())}><CalendarDays size={15} /><span>Voltar para o mês atual</span></button>}
+            {month !== currentMonthKey() && <button className="period-today" onClick={() => selectMonth(currentMonthKey())}><CalendarDays size={15} /><span>Voltar para o mês atual</span></button>}
           </section>}
 
           {activeNav !== "Visão geral" && (
@@ -909,7 +966,13 @@ export function FinanceDashboard({ userName }: { userName: string }) {
                         <b>{currency.format(investment.amount)}</b>
                         <div className="investment-actions">
                           <button onClick={() => setEditingInvestment(investment)} aria-label={"Editar investimento em " + investment.institution}><Pencil size={14} /></button>
-                          <button onClick={() => remove("delete_investment", investment.id, "o investimento em " + investment.institution)} aria-label={"Excluir investimento em " + investment.institution}><Trash2 size={14} /></button>
+                          <button onClick={() => requestSimpleDelete({
+                            action: "delete_investment",
+                            id: investment.id,
+                            title: "Excluir investimento em " + investment.institution + "?",
+                            description: "O valor informado para esta instituição será removido. Seus cálculos financeiros mensais não serão alterados.",
+                            success: "Investimento excluído",
+                          })} aria-label={"Excluir investimento em " + investment.institution}><Trash2 size={14} /></button>
                         </div>
                       </article>
                     ))}
@@ -1069,7 +1132,7 @@ export function FinanceDashboard({ userName }: { userName: string }) {
                       <div><strong>{income.title}</strong><span>{income.paid ? "Recebida" : "Prevista"} para o dia {new Date(income.date).getUTCDate()}</span></div>
                       <b>{currency.format(income.amount)}</b>
                       <button className="row-edit" onClick={() => setEditingIncome(income)} aria-label={"Editar " + income.title}><Pencil size={14} /></button>
-                      <button className="row-delete" onClick={() => remove("delete_transaction", income.id, income.title)} aria-label={"Excluir " + income.title}><Trash2 size={14} /></button>
+                      <button className="row-delete" onClick={() => setIncomeDeleteTarget(income)} aria-label={"Excluir " + income.title}><Trash2 size={14} /></button>
                     </article>)}
                   </div> : <EmptyState icon={Landmark} title="Nenhuma renda neste mês" copy="Cadastre uma ou mais fontes e confirme cada recebimento pelo próprio box." action="Cadastrar renda" onAction={() => openEntry("income")} />}
                 </section>
@@ -1115,7 +1178,13 @@ export function FinanceDashboard({ userName }: { userName: string }) {
                             <div><strong>{expense.title}</strong><span>{expense.category} · {expense.paid ? "pago" : "pendente"} · dia {new Date(expense.date).getUTCDate()}</span></div>
                             <b>{currency.format(expense.amount)}</b>
                             <button className="row-edit" onClick={() => setEditingExpense(expense)} aria-label={"Editar " + expense.title}><Pencil size={14} /></button>
-                            <button className="row-delete" onClick={() => remove("delete_transaction", expense.id, expense.title)} aria-label={"Excluir " + expense.title}><Trash2 size={14} /></button>
+                            <button className="row-delete" onClick={() => requestSimpleDelete({
+                              action: "delete_transaction",
+                              id: expense.id,
+                              title: "Excluir " + expense.title + "?",
+                              description: "Somente este gasto avulso de " + monthLabel(month) + " será removido.",
+                              success: "Gasto excluído",
+                            })} aria-label={"Excluir " + expense.title}><Trash2 size={14} /></button>
                           </article>;
                         })}
                       </div> : <EmptyState icon={ShoppingBag} title="Nenhum gasto neste mês" copy="Cadastre um gasto avulso e acompanhe o pagamento neste mesmo box." action="Cadastrar gasto" onAction={() => openEntry("expense")} />}
@@ -1158,7 +1227,29 @@ export function FinanceDashboard({ userName }: { userName: string }) {
                 <section className="glass-panel credit-card-panel">
                   <div className="panel-heading"><div><span>Valores de {monthLabel(month)}</span><h2>Cartões de crédito</h2></div><button className="text-link" onClick={() => openEntry("card")}><Plus size={14} /> Cartão</button></div>
                   {cards.length ? <div className="cards-editor-grid">{cards.map((card) => (
-                    <InvoiceEditor key={[card.id, month, card.managementMode, card.invoice].join("-")} card={card} month={month} save={save} edit={() => setEditingCard(card)} remove={() => remove("delete_card", card.id, card.bank, true)} addPurchase={() => setPurchaseDialog({ card })} editPurchase={(purchase) => setPurchaseDialog({ card, purchase })} removePurchase={(purchase) => remove("delete_card_purchase", purchase.id, purchase.title, true)} />
+                    <InvoiceEditor
+                      key={[card.id, month, card.managementMode, card.invoice].join("-")}
+                      card={card}
+                      month={month}
+                      save={save}
+                      edit={() => setEditingCard(card)}
+                      remove={() => requestSimpleDelete({
+                        action: "delete_card",
+                        id: card.id,
+                        title: "Excluir o cartão " + card.bank + "?",
+                        description: "As faturas e todas as compras parceladas deste cartão serão apagadas. Contas mensais vinculadas voltarão para pagamento direto.",
+                        success: "Cartão excluído",
+                      })}
+                      addPurchase={() => setPurchaseDialog({ card })}
+                      editPurchase={(purchase) => setPurchaseDialog({ card, purchase })}
+                      removePurchase={(purchase) => requestSimpleDelete({
+                        action: "delete_card_purchase",
+                        id: purchase.id,
+                        title: "Excluir " + purchase.title + "?",
+                        description: "Todas as parcelas passadas e futuras desta compra serão removidas.",
+                        success: "Compra parcelada excluída",
+                      })}
+                    />
                   ))}</div> : (
                     <EmptyState icon={CreditCard} title="Nenhum cartão cadastrado" copy="Cadastre somente banco e vencimento; depois escolha entre total mensal ou compras parceladas." action="Adicionar cartão" onAction={() => openEntry("card")} />
                   )}
@@ -1175,7 +1266,13 @@ export function FinanceDashboard({ userName }: { userName: string }) {
                       <div><strong>{loan.title}</strong><span>{loan.kind === "bank_limit" ? "Limite bancário" : "Empréstimo"} · parcela {loan.installmentNumber}/{loan.installmentCount}</span></div>
                       <b>{currency.format(loan.amount)}</b>
                       <span className="row-spacer" />
-                      <button className="row-delete" onClick={() => remove("delete_loan", loan.id, loan.title, true)} aria-label={"Excluir todas as parcelas de " + loan.title}><Trash2 size={14} /></button>
+                      <button className="row-delete" onClick={() => requestSimpleDelete({
+                        action: "delete_loan",
+                        id: loan.id,
+                        title: "Excluir " + loan.title + "?",
+                        description: "Todas as parcelas passadas e futuras desta sequência serão removidas.",
+                        success: "Crédito parcelado excluído",
+                      })} aria-label={"Excluir todas as parcelas de " + loan.title}><Trash2 size={14} /></button>
                     </article>)}
                   </div> : <EmptyState icon={HandCoins} title="Nenhum crédito parcelado" copy="Cadastre empréstimos ou uso de limite para enxergar as parcelas dos próximos meses." action="Cadastrar crédito" onAction={() => openEntry("loan")} />}
                 </section>
@@ -1201,6 +1298,18 @@ export function FinanceDashboard({ userName }: { userName: string }) {
         <InvestmentEditDialog investment={editingInvestment} open={Boolean(editingInvestment)} setOpen={(open) => { if (!open) setEditingInvestment(null); }} save={save} />
         <ExpenseEditDialog expense={editingExpense} open={Boolean(editingExpense)} setOpen={(open) => { if (!open) setEditingExpense(null); }} save={save} />
         <CardPurchaseDialog data={purchaseDialog} month={month} setOpen={(open) => { if (!open) setPurchaseDialog(null); }} save={save} />
+        <AlertDialog open={Boolean(simpleDeleteTarget)} onOpenChange={(open) => { if (!open) setSimpleDeleteTarget(null); }}>
+          <AlertDialogContent className="entry-dialog delete-dialog">
+            <AlertDialogHeader>
+              <AlertDialogTitle>{simpleDeleteTarget?.title}</AlertDialogTitle>
+              <AlertDialogDescription>{simpleDeleteTarget?.description}</AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancelar</AlertDialogCancel>
+              <Button type="button" variant="destructive" onClick={() => void confirmSimpleDelete()}>Excluir</Button>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
         <AlertDialog open={Boolean(cardBillActionTarget)} onOpenChange={(open) => { if (!open) setCardBillActionTarget(null); }}>
           <AlertDialogContent className="entry-dialog delete-dialog">
             <AlertDialogHeader><AlertDialogTitle>Reabrir a fatura de {cardBillActionTarget ? monthLabel(cardBillActionTarget.paymentMonth) : "este mês"}?</AlertDialogTitle><AlertDialogDescription>A fatura {cardBillActionTarget?.cardName} está marcada como paga. Para {cardBillActionTarget?.cardTransferred ? "retirar" : "incluir"} {cardBillActionTarget?.title}, ela voltará para pendente e poderá ser conferida novamente.</AlertDialogDescription></AlertDialogHeader>
@@ -1210,13 +1319,23 @@ export function FinanceDashboard({ userName }: { userName: string }) {
             </AlertDialogFooter>
           </AlertDialogContent>
         </AlertDialog>
+        <AlertDialog open={Boolean(incomeDeleteTarget)} onOpenChange={(open) => { if (!open) setIncomeDeleteTarget(null); }}>
+          <AlertDialogContent className="entry-dialog delete-dialog">
+            <AlertDialogHeader><AlertDialogTitle>Excluir {incomeDeleteTarget?.title}?</AlertDialogTitle><AlertDialogDescription>{incomeDeleteTarget?.recurrenceId ? "Escolha se deseja apagar apenas a renda deste mês ou toda a sequência recorrente." : "Esta renda existe somente neste mês."}</AlertDialogDescription></AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancelar</AlertDialogCancel>
+              <Button type="button" variant="outline" onClick={() => void deleteIncome("current")}>{incomeDeleteTarget?.recurrenceId ? "Somente deste mês" : "Excluir renda"}</Button>
+              {incomeDeleteTarget?.recurrenceId && <Button type="button" variant="destructive" onClick={() => void deleteIncome("sequence")}>Toda a sequência</Button>}
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
         <AlertDialog open={Boolean(billDeleteTarget)} onOpenChange={(open) => { if (!open) setBillDeleteTarget(null); }}>
           <AlertDialogContent className="entry-dialog delete-dialog">
             <AlertDialogHeader><AlertDialogTitle>Excluir {billDeleteTarget?.title}?</AlertDialogTitle><AlertDialogDescription>{billDeleteTarget?.recurrenceId ? "Escolha se deseja apagar apenas a conta deste mês ou toda a sequência recorrente." : "Esta conta existe somente neste mês."}</AlertDialogDescription></AlertDialogHeader>
             <AlertDialogFooter>
               <AlertDialogCancel>Cancelar</AlertDialogCancel>
-              <AlertDialogAction variant="outline" onClick={() => deleteBill("current")}>Somente deste mês</AlertDialogAction>
-              {billDeleteTarget?.recurrenceId && <AlertDialogAction variant="destructive" onClick={() => deleteBill("sequence")}>Toda a sequência</AlertDialogAction>}
+              <Button type="button" variant="outline" onClick={() => void deleteBill("current")}>{billDeleteTarget?.recurrenceId ? "Somente deste mês" : "Excluir conta"}</Button>
+              {billDeleteTarget?.recurrenceId && <Button type="button" variant="destructive" onClick={() => void deleteBill("sequence")}>Toda a sequência</Button>}
             </AlertDialogFooter>
           </AlertDialogContent>
         </AlertDialog>
