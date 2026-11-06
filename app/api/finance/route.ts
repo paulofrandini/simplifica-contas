@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, lt } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, lt } from "drizzle-orm";
 
 import { getDb } from "@/db";
 import {
@@ -58,6 +58,10 @@ function monthBounds(month: string) {
 function repeatCount(value: unknown, allowed: number[]) {
   const count = Number(value);
   return allowed.includes(count) ? count : allowed[0];
+}
+
+function installmentMonths(firstPaymentMonth: string, installmentCount: number) {
+  return Array.from({ length: installmentCount }, (_, index) => addMonths(firstPaymentMonth, index));
 }
 
 function activePurchase<T extends { firstPaymentMonth: string; installmentCount: number; totalCents: number }>(purchase: T, month: string) {
@@ -318,7 +322,9 @@ export async function POST(request: Request) {
           recurrenceId,
         };
       });
-      for (let index = 0; index < rows.length; index += 5) await db.insert(transactions).values(rows.slice(index, index + 5));
+      await db.transaction(async (tx) => {
+        for (let index = 0; index < rows.length; index += 5) await tx.insert(transactions).values(rows.slice(index, index + 5));
+      });
       return Response.json({ created: rows.length }, { status: 201 });
     }
 
@@ -339,12 +345,14 @@ export async function POST(request: Request) {
           gte(transactions.transactionDate, current[0].transactionDate.slice(0, 7) + "-01T00:00:00.000Z"),
         )).limit(24);
       }
-      for (const target of targets) {
-        await db.update(transactions).set({
-          title, amountCents, category,
-          transactionDate: target.transactionDate.slice(0, 8) + String(day).padStart(2, "0") + "T12:00:00.000Z",
-        }).where(and(eq(transactions.id, target.id), eq(transactions.userId, user.id)));
-      }
+      await db.transaction(async (tx) => {
+        for (const target of targets) {
+          await tx.update(transactions).set({
+            title, amountCents, category,
+            transactionDate: target.transactionDate.slice(0, 8) + String(day).padStart(2, "0") + "T12:00:00.000Z",
+          }).where(and(eq(transactions.id, target.id), eq(transactions.userId, user.id)));
+        }
+      });
       return Response.json({ ok: true, updated: targets.length });
     }
 
@@ -376,7 +384,9 @@ export async function POST(request: Request) {
         billingMonth: addMonths(startMonth, index), recurrenceId, category: identity.category, icon: identity.icon,
         paymentMethod, cardId, cardTransferMode: "confirm" as const, cardTransferred: false,
       }));
-      for (let index = 0; index < rows.length; index += 5) await db.insert(bills).values(rows.slice(index, index + 5));
+      await db.transaction(async (tx) => {
+        for (let index = 0; index < rows.length; index += 5) await tx.insert(bills).values(rows.slice(index, index + 5));
+      });
       return Response.json({ created: rows.length }, { status: 201 });
     }
 
@@ -400,11 +410,30 @@ export async function POST(request: Request) {
         paymentMethod, cardId, cardTransferMode: "confirm" as const, cardTransferred: false,
         ...(paymentMethod === "card" ? { paid: false } : {}),
       };
+      let targets = current;
       if (payload.scope === "future" && current[0].recurrenceId) {
-        await db.update(bills).set(changes).where(and(eq(bills.userId, user.id), eq(bills.recurrenceId, current[0].recurrenceId), gte(bills.billingMonth, current[0].billingMonth)));
-      } else {
-        await db.update(bills).set(changes).where(and(eq(bills.id, id), eq(bills.userId, user.id)));
+        targets = await db.select().from(bills).where(and(
+          eq(bills.userId, user.id),
+          eq(bills.recurrenceId, current[0].recurrenceId),
+          gte(bills.billingMonth, current[0].billingMonth),
+        )).limit(24);
       }
+      await db.transaction(async (tx) => {
+        for (const target of targets) {
+          if (target.paymentMethod === "card" && target.cardId && target.cardTransferred) {
+            await tx.update(cardInvoices).set({ paid: false }).where(and(
+              eq(cardInvoices.userId, user.id),
+              eq(cardInvoices.cardId, target.cardId),
+              eq(cardInvoices.billingMonth, target.billingMonth),
+            ));
+          }
+        }
+        if (payload.scope === "future" && current[0].recurrenceId) {
+          await tx.update(bills).set(changes).where(and(eq(bills.userId, user.id), eq(bills.recurrenceId, current[0].recurrenceId), gte(bills.billingMonth, current[0].billingMonth)));
+        } else {
+          await tx.update(bills).set(changes).where(and(eq(bills.id, id), eq(bills.userId, user.id)));
+        }
+      });
       return Response.json({ ok: true });
     }
 
@@ -442,11 +471,19 @@ export async function POST(request: Request) {
     }
 
     if (action === "update_card") {
+      const cardId = Number(payload.id);
       const bank = String(payload.bank || "").trim();
       const dueDay = Math.min(28, Math.max(1, Number(payload.dueDay) || 1));
       const managementMode = payload.managementMode === "items" ? "items" : "total";
       if (!bank) return Response.json({ error: "Informe o nome do banco." }, { status: 400 });
-      await db.update(creditCards).set({ name: bank, dueDay, managementMode }).where(and(eq(creditCards.id, Number(payload.id)), eq(creditCards.userId, user.id)));
+      const current = await db.select().from(creditCards).where(and(eq(creditCards.id, cardId), eq(creditCards.userId, user.id))).limit(1);
+      if (!current[0]) return Response.json({ error: "Cartão não encontrado." }, { status: 404 });
+      await db.transaction(async (tx) => {
+        await tx.update(creditCards).set({ name: bank, dueDay, managementMode }).where(and(eq(creditCards.id, cardId), eq(creditCards.userId, user.id)));
+        if (current[0].managementMode !== managementMode) {
+          await tx.update(cardInvoices).set({ paid: false }).where(and(eq(cardInvoices.cardId, cardId), eq(cardInvoices.userId, user.id)));
+        }
+      });
       return Response.json({ ok: true });
     }
 
@@ -457,7 +494,7 @@ export async function POST(request: Request) {
       if (invoiceCents < 0) return Response.json({ error: "Informe um valor válido." }, { status: 400 });
       const owned = await db.select().from(creditCards).where(and(eq(creditCards.id, cardId), eq(creditCards.userId, user.id))).limit(1);
       if (!owned[0]) return Response.json({ error: "Cartão não encontrado." }, { status: 404 });
-      await db.insert(cardInvoices).values({ userId: user.id, cardId, billingMonth: invoiceMonth, amountCents: invoiceCents }).onConflictDoUpdate({ target: [cardInvoices.cardId, cardInvoices.billingMonth], set: { amountCents: invoiceCents } });
+      await db.insert(cardInvoices).values({ userId: user.id, cardId, billingMonth: invoiceMonth, amountCents: invoiceCents, paid: false }).onConflictDoUpdate({ target: [cardInvoices.cardId, cardInvoices.billingMonth], set: { amountCents: invoiceCents, paid: false } });
       return Response.json({ ok: true });
     }
 
@@ -467,17 +504,22 @@ export async function POST(request: Request) {
       const owned = await db.select().from(creditCards).where(and(eq(creditCards.id, cardId), eq(creditCards.userId, user.id))).limit(1);
       if (!owned[0]) return Response.json({ error: "Cartão não encontrado." }, { status: 404 });
       const existing = await db.select().from(cardInvoices).where(and(eq(cardInvoices.cardId, cardId), eq(cardInvoices.billingMonth, invoiceMonth), eq(cardInvoices.userId, user.id))).limit(1);
-      let amountCents = existing[0]?.amountCents || 0;
+      const manualAmountCents = existing[0]?.amountCents || 0;
+      let calculatedPurchaseCents = 0;
       if (owned[0].managementMode === "items") {
         const rows = await db.select().from(cardPurchases).where(and(eq(cardPurchases.cardId, cardId), eq(cardPurchases.userId, user.id))).limit(1000);
-        amountCents = rows.reduce((sum, purchase) => sum + (activePurchase(purchase, invoiceMonth)?.amountCents || 0), 0);
+        calculatedPurchaseCents = rows.reduce((sum, purchase) => sum + (activePurchase(purchase, invoiceMonth)?.amountCents || 0), 0);
       }
       const linkedRows = await db.select().from(bills).where(and(eq(bills.userId, user.id), eq(bills.cardId, cardId), eq(bills.paymentMethod, "card"), eq(bills.cardTransferred, true), eq(bills.billingMonth, invoiceMonth))).limit(250);
       const linkedCents = linkedRows.reduce((sum, bill) => sum + bill.amountCents, 0);
-      if (owned[0].managementMode === "items" || amountCents <= 0) amountCents += linkedCents;
-      if (amountCents <= 0) return Response.json({ error: "Cadastre um valor ou uma compra antes de marcar como paga." }, { status: 400 });
+      const effectiveAmountCents = owned[0].managementMode === "items"
+        ? calculatedPurchaseCents + linkedCents
+        : manualAmountCents || linkedCents;
+      if (effectiveAmountCents <= 0) return Response.json({ error: "Cadastre um valor ou uma compra antes de marcar como paga." }, { status: 400 });
+      // No modo total, zero identifica que o valor é apenas uma estimativa das contas vinculadas.
+      const storedAmountCents = owned[0].managementMode === "items" ? effectiveAmountCents : manualAmountCents;
       const paid = !existing[0]?.paid;
-      await db.insert(cardInvoices).values({ userId: user.id, cardId, billingMonth: invoiceMonth, amountCents, paid }).onConflictDoUpdate({ target: [cardInvoices.cardId, cardInvoices.billingMonth], set: { amountCents, paid } });
+      await db.insert(cardInvoices).values({ userId: user.id, cardId, billingMonth: invoiceMonth, amountCents: storedAmountCents, paid }).onConflictDoUpdate({ target: [cardInvoices.cardId, cardInvoices.billingMonth], set: { amountCents: storedAmountCents, paid } });
       return Response.json({ ok: true });
     }
 
@@ -492,9 +534,30 @@ export async function POST(request: Request) {
         const cardId = Number(payload.cardId);
         const owned = await db.select().from(creditCards).where(and(eq(creditCards.id, cardId), eq(creditCards.userId, user.id))).limit(1);
         if (!owned[0]) return Response.json({ error: "Cartão não encontrado." }, { status: 404 });
-        await db.insert(cardPurchases).values({ userId: user.id, cardId, title, totalCents, installmentCount, firstPaymentMonth });
+        await db.transaction(async (tx) => {
+          await tx.insert(cardPurchases).values({ userId: user.id, cardId, title, totalCents, installmentCount, firstPaymentMonth });
+          await tx.update(cardInvoices).set({ paid: false }).where(and(
+            eq(cardInvoices.userId, user.id),
+            eq(cardInvoices.cardId, cardId),
+            inArray(cardInvoices.billingMonth, installmentMonths(firstPaymentMonth, installmentCount)),
+          ));
+        });
       } else {
-        await db.update(cardPurchases).set({ title, totalCents, installmentCount, firstPaymentMonth }).where(and(eq(cardPurchases.id, Number(payload.id)), eq(cardPurchases.userId, user.id)));
+        const purchaseId = Number(payload.id);
+        const current = await db.select().from(cardPurchases).where(and(eq(cardPurchases.id, purchaseId), eq(cardPurchases.userId, user.id))).limit(1);
+        if (!current[0]) return Response.json({ error: "Compra não encontrada." }, { status: 404 });
+        const affectedMonths = [...new Set([
+          ...installmentMonths(current[0].firstPaymentMonth, current[0].installmentCount),
+          ...installmentMonths(firstPaymentMonth, installmentCount),
+        ])];
+        await db.transaction(async (tx) => {
+          await tx.update(cardPurchases).set({ title, totalCents, installmentCount, firstPaymentMonth }).where(and(eq(cardPurchases.id, purchaseId), eq(cardPurchases.userId, user.id)));
+          await tx.update(cardInvoices).set({ paid: false }).where(and(
+            eq(cardInvoices.userId, user.id),
+            eq(cardInvoices.cardId, current[0].cardId),
+            inArray(cardInvoices.billingMonth, affectedMonths),
+          ));
+        });
       }
       return Response.json({ ok: true }, { status: action === "add_card_purchase" ? 201 : 200 });
     }
@@ -511,7 +574,9 @@ export async function POST(request: Request) {
         userId: user.id, title, kind, amountCents: installmentCents,
         billingMonth: addMonths(firstPaymentMonth, index), installmentNumber: index + 1, installmentCount, recurrenceId,
       }));
-      for (let index = 0; index < rows.length; index += 5) await db.insert(loanInstallments).values(rows.slice(index, index + 5));
+      await db.transaction(async (tx) => {
+        for (let index = 0; index < rows.length; index += 5) await tx.insert(loanInstallments).values(rows.slice(index, index + 5));
+      });
       return Response.json({ created: rows.length }, { status: 201 });
     }
 
@@ -544,23 +609,62 @@ export async function POST(request: Request) {
       return Response.json({ ok: true });
     }
 
-    if (action === "delete_transaction") await db.delete(transactions).where(and(eq(transactions.id, Number(payload.id)), eq(transactions.userId, user.id)));
-    else if (action === "delete_bill") {
-      const billRows = await db.select().from(bills).where(and(eq(bills.id, Number(payload.id)), eq(bills.userId, user.id))).limit(1);
-      if (billRows[0]?.recurrenceId && payload.scope === "sequence") {
-        await db.delete(bills).where(and(eq(bills.recurrenceId, billRows[0].recurrenceId), eq(bills.userId, user.id)));
+    if (action === "delete_transaction") {
+      const transactionRows = await db.select().from(transactions).where(and(eq(transactions.id, Number(payload.id)), eq(transactions.userId, user.id))).limit(1);
+      if (transactionRows[0]?.recurrenceId && payload.scope === "sequence") {
+        await db.delete(transactions).where(and(eq(transactions.recurrenceId, transactionRows[0].recurrenceId), eq(transactions.userId, user.id)));
       } else {
-        await db.delete(bills).where(and(eq(bills.id, Number(payload.id)), eq(bills.userId, user.id)));
+        await db.delete(transactions).where(and(eq(transactions.id, Number(payload.id)), eq(transactions.userId, user.id)));
       }
     }
-    else if (action === "delete_card_purchase") await db.delete(cardPurchases).where(and(eq(cardPurchases.id, Number(payload.id)), eq(cardPurchases.userId, user.id)));
+    else if (action === "delete_bill") {
+      const billId = Number(payload.id);
+      const current = await db.select().from(bills).where(and(eq(bills.id, billId), eq(bills.userId, user.id))).limit(1);
+      if (!current[0]) return Response.json({ error: "Conta não encontrada." }, { status: 404 });
+      const targets = current[0].recurrenceId && payload.scope === "sequence"
+        ? await db.select().from(bills).where(and(eq(bills.recurrenceId, current[0].recurrenceId), eq(bills.userId, user.id))).limit(24)
+        : current;
+      await db.transaction(async (tx) => {
+        for (const target of targets) {
+          if (target.paymentMethod === "card" && target.cardId && target.cardTransferred) {
+            await tx.update(cardInvoices).set({ paid: false }).where(and(
+              eq(cardInvoices.userId, user.id),
+              eq(cardInvoices.cardId, target.cardId),
+              eq(cardInvoices.billingMonth, target.billingMonth),
+            ));
+          }
+        }
+        if (current[0].recurrenceId && payload.scope === "sequence") {
+          await tx.delete(bills).where(and(eq(bills.recurrenceId, current[0].recurrenceId), eq(bills.userId, user.id)));
+        } else {
+          await tx.delete(bills).where(and(eq(bills.id, billId), eq(bills.userId, user.id)));
+        }
+      });
+    }
+    else if (action === "delete_card_purchase") {
+      const purchaseId = Number(payload.id);
+      const current = await db.select().from(cardPurchases).where(and(eq(cardPurchases.id, purchaseId), eq(cardPurchases.userId, user.id))).limit(1);
+      if (!current[0]) return Response.json({ error: "Compra não encontrada." }, { status: 404 });
+      await db.transaction(async (tx) => {
+        await tx.update(cardInvoices).set({ paid: false }).where(and(
+          eq(cardInvoices.userId, user.id),
+          eq(cardInvoices.cardId, current[0].cardId),
+          inArray(cardInvoices.billingMonth, installmentMonths(current[0].firstPaymentMonth, current[0].installmentCount)),
+        ));
+        await tx.delete(cardPurchases).where(and(eq(cardPurchases.id, purchaseId), eq(cardPurchases.userId, user.id)));
+      });
+    }
     else if (action === "delete_investment") await db.delete(investments).where(and(eq(investments.id, Number(payload.id)), eq(investments.userId, user.id)));
     else if (action === "delete_card") {
       const cardId = Number(payload.id);
-      await db.update(bills).set({ paymentMethod: "direct", cardId: null, cardTransferMode: "confirm", cardTransferred: false }).where(and(eq(bills.cardId, cardId), eq(bills.userId, user.id)));
-      await db.delete(cardPurchases).where(and(eq(cardPurchases.cardId, cardId), eq(cardPurchases.userId, user.id)));
-      await db.delete(cardInvoices).where(and(eq(cardInvoices.cardId, cardId), eq(cardInvoices.userId, user.id)));
-      await db.delete(creditCards).where(and(eq(creditCards.id, cardId), eq(creditCards.userId, user.id)));
+      const current = await db.select().from(creditCards).where(and(eq(creditCards.id, cardId), eq(creditCards.userId, user.id))).limit(1);
+      if (!current[0]) return Response.json({ error: "Cartão não encontrado." }, { status: 404 });
+      await db.transaction(async (tx) => {
+        await tx.update(bills).set({ paymentMethod: "direct", cardId: null, cardTransferMode: "confirm", cardTransferred: false, paid: false }).where(and(eq(bills.cardId, cardId), eq(bills.userId, user.id)));
+        await tx.delete(cardPurchases).where(and(eq(cardPurchases.cardId, cardId), eq(cardPurchases.userId, user.id)));
+        await tx.delete(cardInvoices).where(and(eq(cardInvoices.cardId, cardId), eq(cardInvoices.userId, user.id)));
+        await tx.delete(creditCards).where(and(eq(creditCards.id, cardId), eq(creditCards.userId, user.id)));
+      });
     } else return Response.json({ error: "Ação não reconhecida." }, { status: 400 });
     return Response.json({ ok: true });
   } catch (error) {
