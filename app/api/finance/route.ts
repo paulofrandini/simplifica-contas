@@ -1,4 +1,5 @@
 import { and, desc, eq, gte, inArray, lt } from "drizzle-orm";
+import postgres from "postgres";
 
 import { getDb } from "@/db";
 import {
@@ -15,12 +16,18 @@ type FinanceAction =
   | "add_loan" | "toggle_loan" | "delete_loan"
   | "add_investment" | "update_investment" | "delete_investment";
 
-function errorMessage(error: unknown) {
-  const message = error instanceof Error ? error.message : "Erro inesperado";
-  if (message.includes("no such table") || message.includes("no such column")) {
-    return "O armazenamento financeiro está sendo atualizado. Tente novamente em instantes.";
+function financeErrorResponse(method: "GET" | "POST", error: unknown) {
+  const cause: unknown = error instanceof Error ? error.cause ?? error : error;
+  if (cause instanceof postgres.PostgresError) {
+    console.error("Falha na API financeira", { method, code: cause.code, constraint: cause.constraint_name });
+  } else {
+    console.error("Falha na API financeira", { method });
   }
-  return message;
+
+  const message = method === "GET"
+    ? "Não foi possível carregar seus dados financeiros. Tente novamente."
+    : "Não foi possível salvar a alteração. Tente novamente.";
+  return Response.json({ error: message }, { status: 500 });
 }
 
 function asMoneyCents(value: unknown) {
@@ -281,7 +288,7 @@ export async function GET(request: Request) {
       summary,
     });
   } catch (error) {
-    return Response.json({ error: errorMessage(error) }, { status: 500 });
+    return financeErrorResponse("GET", error);
   }
 }
 
@@ -460,13 +467,16 @@ export async function POST(request: Request) {
       const invoiceCents = asMoneyCents(payload.invoice);
       const paymentMonth = validMonth(String(payload.paymentMonth || payload.month || ""));
       if (!bank || invoiceCents < 0) return Response.json({ error: "Informe o banco e um valor válido." }, { status: 400 });
-      const [created] = await db.insert(creditCards).values({
-        userId: user.id, name: bank, lastFour: "0000", brand: "BANCO",
-        limitCents: 0, invoiceCents: 0, dueDay, managementMode,
-      }).returning();
-      if (managementMode === "total") {
-        await db.insert(cardInvoices).values({ userId: user.id, cardId: created.id, billingMonth: paymentMonth, amountCents: invoiceCents });
-      }
+      const created = await db.transaction(async (tx) => {
+        const [card] = await tx.insert(creditCards).values({
+          userId: user.id, name: bank, lastFour: "0000", brand: "BANCO",
+          limitCents: 0, invoiceCents: 0, dueDay, managementMode,
+        }).returning({ id: creditCards.id });
+        if (managementMode === "total") {
+          await tx.insert(cardInvoices).values({ userId: user.id, cardId: card.id, billingMonth: paymentMonth, amountCents: invoiceCents });
+        }
+        return card;
+      });
       return Response.json({ id: created.id, paymentMonth }, { status: 201 });
     }
 
@@ -668,6 +678,6 @@ export async function POST(request: Request) {
     } else return Response.json({ error: "Ação não reconhecida." }, { status: 400 });
     return Response.json({ ok: true });
   } catch (error) {
-    return Response.json({ error: errorMessage(error) }, { status: 500 });
+    return financeErrorResponse("POST", error);
   }
 }
