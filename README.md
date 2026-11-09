@@ -25,22 +25,22 @@ Aplicação de organização financeira pessoal construída com Next.js, Supabas
 | `components/` | componentes visuais |
 | `db/` | esquema Drizzle e conexão PostgreSQL |
 | `lib/` | cálculos, autenticação e clientes Supabase |
-| `supabase/migrations/` | criação das tabelas, índices e políticas RLS |
+| `supabase/migrations/` | criação e atualizações do esquema do banco |
 | `tests/` | testes dos cálculos e contratos essenciais |
 
 ## 1. Configurar o Supabase
 
 1. Abra o projeto `simplifica-contas` no Supabase.
 2. Entre em **SQL Editor**.
-3. Copie todo o conteúdo de `supabase/migrations/0001_initial_schema.sql`.
-4. Execute o script uma única vez.
+3. Em um banco novo, execute o conteúdo de `supabase/migrations/0001_initial_schema.sql`.
+4. Em seguida, execute `supabase/migrations/0002_fix_month_constraints.sql`. Se já aplicou a migração `0001`, execute somente `0002`.
 5. Em **Authentication > URL Configuration**, defina:
    - Site URL local: `http://localhost:3000`;
    - Redirect URL local: `http://localhost:3000/**`;
    - depois da publicação, adicione `https://SEU-DOMINIO.vercel.app/**` ou `https://SEU-DOMINIO.up.railway.app/**`.
 6. Mantenha o login por e-mail e senha habilitado.
 
-O script cria as tabelas e ativa Row Level Security. Cada registro possui um `user_id` ligado ao usuário autenticado.
+A primeira migração cria as tabelas e ativa Row Level Security. A segunda corrige a validação de meses das contas, faturas, compras parceladas e empréstimos. Cada lançamento possui um `user_id` ligado ao usuário autenticado.
 
 ## 2. Variáveis de ambiente
 
